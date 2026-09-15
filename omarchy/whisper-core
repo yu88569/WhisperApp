@@ -1,0 +1,573 @@
+#!/usr/bin/env python3
+"""
+whisper-core — Omarchy Dictation Engine.
+Powers fast speech-to-text with Groq Whisper and Llama 3.3 AI correction,
+dual-mode hotkeys (hold-to-talk + tap-to-toggle), and smart Wayland pasting.
+"""
+
+import os
+import sys
+import time
+import json
+import uuid
+import signal
+import shutil
+import urllib.request
+import urllib.error
+import subprocess
+import threading
+from pathlib import Path
+
+# Paths
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "omarchy"
+CONFIG_FILE = CONFIG_DIR / "whisper.json"
+STATE_FILE = STATE_DIR / "whisper.json"
+
+TEMP_WAV = Path("/tmp/whisper-active.wav")
+PID_FILE = Path("/tmp/whisper-record.pid")
+KEYDOWN_FILE = Path("/tmp/whisper-keydown.time")
+
+GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_LLM_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+DEFAULT_CONFIG = {
+    "groq_api_key": "",
+    "language": "auto",
+    "stt_model": "whisper-large-v3-turbo",
+    "correct_text": True,
+    "llm_model": "openai/gpt-oss-120b",
+    "restore_clipboard": True,
+    "paste_delay_ms": 350,
+    "custom_dictionary": []
+}
+
+DEFAULT_STATE = {
+    "state": "idle",
+    "text": "",
+    "error": "",
+    "started_at": 0.0,
+    "history": []
+}
+
+TERMINAL_CLASSES = {
+    "foot", "alacritty", "kitty", "ghostty", "com.mitchellh.ghostty",
+    "xterm", "wezterm", "gnome-terminal", "urxvt", "st", "terminator"
+}
+
+
+# --- Configuration & State Helpers ---
+
+def ensure_dirs():
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_config() -> dict:
+    ensure_dirs()
+    cfg = DEFAULT_CONFIG.copy()
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                if isinstance(saved, dict):
+                    cfg.update(saved)
+        except Exception as e:
+            sys.stderr.write(f"whisper-core: warning reading config: {e}\n")
+    return cfg
+
+
+def save_config(cfg: dict):
+    ensure_dirs()
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    tmp.replace(CONFIG_FILE)
+
+
+def get_api_key(cfg: dict) -> str:
+    key = cfg.get("groq_api_key", "").strip()
+    if not key:
+        key = os.environ.get("GROQ_API_KEY", "").strip()
+    return key
+
+
+def load_state() -> dict:
+    ensure_dirs()
+    state = DEFAULT_STATE.copy()
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                if isinstance(saved, dict):
+                    state.update(saved)
+        except Exception as e:
+            sys.stderr.write(f"whisper-core: warning reading state: {e}\n")
+    return state
+
+
+def update_state(**kwargs):
+    ensure_dirs()
+    current = load_state()
+    current.update(kwargs)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(current, f, indent=2, ensure_ascii=False)
+    tmp.replace(STATE_FILE)
+
+
+# --- Audio Recording ---
+
+def is_recording_active() -> bool:
+    if not PID_FILE.exists():
+        return False
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except (ValueError, OSError):
+        if PID_FILE.exists():
+            PID_FILE.unlink(missing_ok=True)
+        return False
+
+
+def start_recording():
+    if is_recording_active():
+        sys.stderr.write("whisper-core: recording already in progress\n")
+        return
+
+    # Clean up previous audio file
+    if TEMP_WAV.exists():
+        TEMP_WAV.unlink(missing_ok=True)
+
+    # Check for pw-record
+    if not shutil.which("pw-record"):
+        update_state(state="error", error="pw-record command not found (PipeWire required)")
+        sys.stderr.write("whisper-core: pw-record not found\n")
+        return
+
+    cmd = [
+        "pw-record",
+        "--rate", "16000",
+        "--channels", "1",
+        "--format", "s16",
+        str(TEMP_WAV)
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=os.setsid
+        )
+        PID_FILE.write_text(str(proc.pid))
+        update_state(state="recording", text="", error="", started_at=time.time())
+        print("RECORDING_STARTED")
+    except Exception as e:
+        update_state(state="error", error=f"Failed to start recording: {e}")
+        sys.stderr.write(f"whisper-core: recording error: {e}\n")
+
+
+def stop_recording_and_process():
+    if not is_recording_active():
+        sys.stderr.write("whisper-core: no active recording to stop\n")
+        return
+
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        # PipeWire pw-record flushes WAV header on SIGINT
+        os.kill(pid, signal.SIGINT)
+        # Give it up to 1.5 seconds to flush file cleanly
+        for _ in range(15):
+            time.sleep(0.1)
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                break
+        else:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    except Exception as e:
+        sys.stderr.write(f"whisper-core: error stopping recording process: {e}\n")
+    finally:
+        PID_FILE.unlink(missing_ok=True)
+
+    # Check audio file validity
+    if not TEMP_WAV.exists() or TEMP_WAV.stat().st_size < 1000:
+        update_state(state="error", error="Audio was too short or empty")
+        time.sleep(1.2)
+        update_state(state="idle", error="")
+        return
+
+    # Process dictation in foreground
+    process_audio_pipeline()
+
+
+def cancel_recording():
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        PID_FILE.unlink(missing_ok=True)
+
+    if TEMP_WAV.exists():
+        TEMP_WAV.unlink(missing_ok=True)
+
+    if KEYDOWN_FILE.exists():
+        KEYDOWN_FILE.unlink(missing_ok=True)
+
+    update_state(state="idle", text="", error="")
+    print("CANCELLED")
+
+
+# --- Hotkey Press & Release Handling ---
+
+def on_key_down():
+    now = time.time()
+    current = load_state()
+    state = current.get("state", "idle")
+
+    if state == "recording":
+        # Second tap while recording -> stop and process
+        KEYDOWN_FILE.unlink(missing_ok=True)
+        stop_recording_and_process()
+    elif state in ("idle", "done", "error"):
+        # First press -> record key-down time and start
+        KEYDOWN_FILE.write_text(str(now))
+        start_recording()
+
+
+def on_key_up():
+    now = time.time()
+    if not KEYDOWN_FILE.exists():
+        return
+
+    try:
+        down_time = float(KEYDOWN_FILE.read_text().strip())
+    except (ValueError, OSError):
+        down_time = now
+    finally:
+        KEYDOWN_FILE.unlink(missing_ok=True)
+
+    elapsed = now - down_time
+
+    # If held for more than 350ms -> Hold-to-Talk (release stops recording)
+    # If released quickly (< 350ms) -> Toggle mode (keep recording until next tap)
+    if elapsed >= 0.35:
+        stop_recording_and_process()
+
+
+def toggle_recording():
+    current = load_state()
+    state = current.get("state", "idle")
+    if state == "recording" or is_recording_active():
+        stop_recording_and_process()
+    else:
+        start_recording()
+
+
+# --- Groq API Pipeline ---
+
+def build_multipart_body(fields: dict, files: dict, boundary: str) -> bytes:
+    body = []
+    for k, v in fields.items():
+        body.append(f"--{boundary}\r\n".encode("utf-8"))
+        body.append(f'Content-Disposition: form-data; name="{k}"\r\n\r\n'.encode("utf-8"))
+        body.append(f"{v}\r\n".encode("utf-8"))
+
+    for k, (filename, content, mime) in files.items():
+        body.append(f"--{boundary}\r\n".encode("utf-8"))
+        body.append(f'Content-Disposition: form-data; name="{k}"; filename="{filename}"\r\n'.encode("utf-8"))
+        body.append(f"Content-Type: {mime}\r\n\r\n".encode("utf-8"))
+        body.append(content)
+        body.append(b"\r\n")
+
+    body.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(body)
+
+
+def transcribe_audio(api_key: str, cfg: dict) -> str:
+    with open(TEMP_WAV, "rb") as f:
+        audio_bytes = f.read()
+
+    boundary = f"----WebKitFormBoundary{uuid.uuid4().hex}"
+    fields = {
+        "model": cfg.get("stt_model", "whisper-large-v3-turbo"),
+        "response_format": "json"
+    }
+
+    lang = cfg.get("language", "auto")
+    if lang and lang != "auto":
+        fields["language"] = lang
+
+    # Custom prompt / terminology hints
+    dict_hints = [item.get("replace", "") for item in cfg.get("custom_dictionary", []) if isinstance(item, dict)]
+    if dict_hints:
+        fields["prompt"] = ", ".join(dict_hints[:30])
+
+    files = {
+        "file": ("recording.wav", audio_bytes, "audio/wav")
+    }
+
+    payload = build_multipart_body(fields, files, boundary)
+
+    req = urllib.request.Request(GROQ_STT_URL, data=payload, method="POST")
+    req.add_header("User-Agent", "WhisperApp/1.0")
+    req.add_header("Authorization", f"Bearer {api_key}")
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("text", "").strip()
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"STT API error ({e.code}): {err_body}")
+    except Exception as e:
+        raise RuntimeError(f"STT connection error: {e}")
+
+
+def correct_text_with_llm(raw_text: str, api_key: str, cfg: dict) -> str:
+    if not raw_text:
+        return ""
+
+    system_prompt = (
+        "You are a text correction assistant for speech-to-text output, which often contains "
+        "misheard words and missing punctuation.\n"
+        "Your tasks:\n"
+        "- Fix misheard/garbled words based on context\n"
+        "- Add punctuation and spacing to improve readability\n"
+        "- Do NOT add new content, summarize, translate, or change word endings/speaker gender\n"
+        "- Return ONLY the corrected text — no explanations, no quotation marks\n"
+        "The text may be in Thai, English, or mixed Thai/English."
+    )
+
+    custom_dict = cfg.get("custom_dictionary", [])
+    if custom_dict:
+        hints = "\n".join([f"- '{item.get('find')}' -> '{item.get('replace')}'" for item in custom_dict if item.get("find") and item.get("replace")])
+        if hints:
+            system_prompt += "\n\nApply these known corrections when matching:\n" + hints
+
+    payload = json.dumps({
+        "model": cfg.get("llm_model", "openai/gpt-oss-120b"),
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": raw_text}
+        ]
+    }).encode("utf-8")
+
+    req = urllib.request.Request(GROQ_LLM_URL, data=payload, method="POST")
+    req.add_header("User-Agent", "WhisperApp/1.0")
+    req.add_header("Authorization", f"Bearer {api_key}")
+    req.add_header("Content-Type", "application/json")
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            choices = data.get("choices", [])
+            if choices and "message" in choices[0]:
+                content = choices[0]["message"].get("content", "").strip()
+                # Strip wrapping quotes if LLM added any
+                if content.startswith('"') and content.endswith('"') and len(content) > 1:
+                    content = content[1:-1].strip()
+                return content
+            return raw_text
+    except Exception as e:
+        sys.stderr.write(f"whisper-core: LLM correction failed, falling back to raw text: {e}\n")
+        return raw_text
+
+
+def apply_custom_dictionary(text: str, custom_dict: list) -> str:
+    res = text
+    for item in custom_dict:
+        find_word = item.get("find", "")
+        replace_word = item.get("replace", "")
+        if find_word and replace_word:
+            res = res.replace(find_word, replace_word)
+    return res
+
+
+# --- Smart Wayland Pasting ---
+
+def get_focused_window_class() -> str:
+    try:
+        out = subprocess.check_output(["hyprctl", "activewindow", "-j"], timeout=1)
+        data = json.loads(out.decode("utf-8"))
+        return str(data.get("class", "")).lower()
+    except Exception:
+        return ""
+
+
+def smart_paste(text: str, restore_clipboard: bool, delay_ms: int):
+    if not text:
+        return
+
+    # Backup original clipboard
+    orig_clipboard = None
+    try:
+        orig_clipboard = subprocess.check_output(
+            ["wl-paste", "--no-newline"],
+            stderr=subprocess.DEVNULL,
+            timeout=1
+        )
+    except Exception:
+        pass
+
+    # Copy new text to clipboard
+    proc = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
+    proc.communicate(input=text.encode("utf-8"))
+
+    # Determine paste shortcut based on active window
+    win_class = get_focused_window_class()
+    is_terminal = any(term in win_class for term in TERMINAL_CLASSES)
+
+    # Allow Wayland clipboard to settle
+    time.sleep(0.08)
+
+    # Simulate keystroke via wtype
+    if is_terminal:
+        # Ctrl + Shift + V for terminals
+        subprocess.run(["wtype", "-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl"])
+    else:
+        # Ctrl + V for GUI apps
+        subprocess.run(["wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl"])
+
+    # Restore clipboard after delay if requested
+    if restore_clipboard and orig_clipboard is not None:
+        def restore():
+            time.sleep(max(0.2, delay_ms / 1000.0))
+            try:
+                p = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
+                p.communicate(input=orig_clipboard)
+            except Exception:
+                pass
+
+        threading.Thread(target=restore, daemon=True).start()
+
+
+# --- Main Pipeline Execution ---
+
+def process_audio_pipeline():
+    cfg = load_config()
+    api_key = get_api_key(cfg)
+
+    if not api_key:
+        update_state(state="error", error="Please configure Groq API Key in Settings")
+        time.sleep(2.5)
+        update_state(state="idle", error="")
+        return
+
+    # 1. Transcribe
+    update_state(state="transcribing")
+    try:
+        raw_text = transcribe_audio(api_key, cfg)
+    except Exception as e:
+        update_state(state="error", error=str(e))
+        time.sleep(2.5)
+        update_state(state="idle", error="")
+        return
+
+    if not raw_text:
+        update_state(state="error", error="No speech detected")
+        time.sleep(1.5)
+        update_state(state="idle", error="")
+        return
+
+    final_text = raw_text
+
+    # 2. AI Text Correction (if enabled)
+    if cfg.get("correct_text", True):
+        update_state(state="correcting", text=raw_text)
+        final_text = correct_text_with_llm(raw_text, api_key, cfg)
+
+    # 3. Deterministic dictionary replacement
+    final_text = apply_custom_dictionary(final_text, cfg.get("custom_dictionary", []))
+
+    # 4. Smart Paste
+    update_state(state="pasting", text=final_text)
+    smart_paste(
+        final_text,
+        restore_clipboard=cfg.get("restore_clipboard", True),
+        delay_ms=cfg.get("paste_delay_ms", 350)
+    )
+
+    # 5. Record History
+    state = load_state()
+    history = state.get("history", [])
+    history.insert(0, {
+        "text": final_text,
+        "raw": raw_text,
+        "timestamp": int(time.time())
+    })
+    history = history[:30]  # Keep last 30 entries
+
+    update_state(state="done", text=final_text, history=history)
+
+    # Clean up audio file
+    if TEMP_WAV.exists():
+        TEMP_WAV.unlink(missing_ok=True)
+
+    # Auto-reset to idle
+    time.sleep(1.2)
+    update_state(state="idle")
+
+
+# --- CLI Commands ---
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: whisper-core [start|stop|toggle|cancel|key-down|key-up|status|set-key|config]")
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+
+    if cmd == "start":
+        start_recording()
+    elif cmd == "stop":
+        stop_recording_and_process()
+    elif cmd == "toggle":
+        toggle_recording()
+    elif cmd == "cancel":
+        cancel_recording()
+    elif cmd == "key-down":
+        on_key_down()
+    elif cmd == "key-up":
+        on_key_up()
+    elif cmd == "status":
+        print(json.dumps(load_state(), indent=2, ensure_ascii=False))
+    elif cmd == "set-key":
+        if len(sys.argv) < 3:
+            sys.stderr.write("Usage: whisper-core set-key <GROQ_API_KEY>\n")
+            sys.exit(1)
+        cfg = load_config()
+        cfg["groq_api_key"] = sys.argv[2].strip()
+        save_config(cfg)
+        print("Groq API Key saved successfully.")
+    elif cmd == "config":
+        if len(sys.argv) == 2:
+            print(json.dumps(load_config(), indent=2, ensure_ascii=False))
+        elif len(sys.argv) >= 4 and sys.argv[2] == "set":
+            key = sys.argv[3]
+            val = sys.argv[4]
+            cfg = load_config()
+            if val.lower() == "true":
+                cfg[key] = True
+            elif val.lower() == "false":
+                cfg[key] = False
+            else:
+                cfg[key] = val
+            save_config(cfg)
+            print(f"Set {key} = {val}")
+    else:
+        sys.stderr.write(f"Unknown command: {cmd}\n")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

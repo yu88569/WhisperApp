@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "id": "yux.whisper",
+  "name": "Whisper Dictation",
+  "version": "1.0.0",
+  "author": "yux",
+  "license": "MIT",
+  "description": "Fast voice-to-text dictation powered by Groq Whisper and Llama 3.3 AI text correction, dual-mode triggering, and bottom-center OSD overlay for Omarchy Linux.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Whisper Dictation",
+    "description": "Voice-to-text dictation with AI correction",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "showOsd": true,
+      "correctText": true,
+      "language": "auto"
+    },
+    "schema": [
+      {
+        "key": "correctText",
+        "type": "boolean",
+        "label": "AI Text Correction (Llama 3.3)",
+        "defaultValue": true
+      },
+      {
+        "key": "showOsd",
+        "type": "boolean",
+        "label": "Show Floating OSD while dictating",
+        "defaultValue": true
+      }
+    ]
+  }
+}

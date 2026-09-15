@@ -1,0 +1,78 @@
+#!/bin/bash
+# whisper-ctl — CLI controller for Whisper Dictation on Omarchy
+# Integrates with Hyprland keybindings, Omarchy shell, and whisper-core.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+CORE="$SCRIPT_DIR/whisper-core"
+TARGET="yux.whisper"
+
+usage() {
+  cat <<USAGE
+Usage: whisper-ctl <command> [args]
+
+Dictation Commands:
+  key-down             Key press event from Hyprland (SUPER + H)
+  key-up               Key release event from Hyprland (dual-mode trigger)
+  start                Start recording audio
+  stop                 Stop recording, transcribe with Groq, and paste
+  toggle               Toggle recording on / off
+  cancel               Cancel active recording immediately
+
+UI & Status Commands:
+  status               Show current dictation state (JSON)
+  open | panel         Open Whisper panel on Omarchy bar
+  close                Close Whisper panel
+  history              Print recent dictation history
+
+Configuration:
+  set-key <KEY>        Set your Groq API key
+  config               Show current configuration (JSON)
+  config set <K> <V>   Update configuration setting (e.g. correct_text false)
+
+Examples:
+  whisper-ctl toggle
+  whisper-ctl set-key gsk_xxxxxx
+  whisper-ctl status
+USAGE
+}
+
+cmd="${1:-}"
+
+if [[ -z "$cmd" || "$cmd" == "-h" || "$cmd" == "--help" || "$cmd" == "help" ]]; then
+  usage
+  exit 0
+fi
+
+shift
+
+case "$cmd" in
+  key-down|key-up|start|stop|toggle|cancel|status)
+    exec "$CORE" "$cmd" "$@"
+    ;;
+  open|panel)
+    if command -v omarchy-shell >/dev/null 2>&1; then
+      omarchy-shell -q "$TARGET" open || true
+    fi
+    ;;
+  close)
+    if command -v omarchy-shell >/dev/null 2>&1; then
+      omarchy-shell -q "$TARGET" close || true
+    fi
+    ;;
+  history)
+    "$CORE" status | jq -r '.history[]? | "\(.timestamp | todate) — \(.text)"' 2>/dev/null || "$CORE" status
+    ;;
+  set-key)
+    exec "$CORE" set-key "$@"
+    ;;
+  config)
+    exec "$CORE" config "$@"
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
