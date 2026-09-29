@@ -1,6 +1,6 @@
 # Whisper Dictation for Omarchy Linux
 
-An Omarchy Shell Plugin and native dictation system for Arch Linux + Hyprland. Powered by Groq's `whisper-large-v3-turbo` for lightning-fast transcription and `openai/gpt-oss-120b` for bilingual (Thai/English) grammar and punctuation correction.
+An Omarchy Shell Plugin and native dictation system for Arch Linux + Hyprland. Powered by Groq's accuracy-focused `whisper-large-v3` for Thai/English transcription, with optional `openai/gpt-oss-120b` grammar and punctuation correction.
 
 ## Features
 
@@ -9,13 +9,14 @@ An Omarchy Shell Plugin and native dictation system for Arch Linux + Hyprland. P
   - **Tap-to-Toggle**: Tap `SUPER + H` once to start speaking, tap again to finish.
 - ❌ **Instant Cancel (`SUPER + ESC`)**: Abort active dictation without sending audio to the cloud.
 - ⚡ **Groq 2-Stage Pipeline**:
-  - Stage 1: `whisper-large-v3-turbo` Speech-to-Text.
-  - Stage 2: `openai/gpt-oss-120b` text correction (fixes misheard words, adds punctuation, formats numbers).
+  - Stage 1: `whisper-large-v3` Speech-to-Text.
+  - Optional Stage 2: `openai/gpt-oss-120b` punctuation, spacing, and context-aware English term correction. Enable `correct_text` to handle terms beyond the built-in names.
+  - Common product names spoken in Thai (such as ดิสคอร์ด → Discord and แชตจีพีที → ChatGPT) are restored to English spelling before pasting.
 - 📋 **Smart Wayland Auto-Paste**:
   - Automatically detects whether the focused window is a Terminal (`foot`, `alacritty`, `kitty`, `ghostty`) or a GUI app (`Ctrl+Shift+V` vs `Ctrl+V`).
   - Preserves and restores existing clipboard content after pasting.
 - 🌊 **Bottom-Center Floating OSD**:
-  - Beautiful Quickshell overlay showing live listening state, elapsed timer, transcribing/polishing spinner, and completion checkmark.
+  - Quickshell overlay with voice-reactive level bars while recording, elapsed timer, transcribing/polishing spinner, and completion checkmark.
 - 📊 **Omarchy Bar Widget (`yux.whisper`)**:
   - Displays mic status in the top bar.
   - Popup panel allows configuring Groq API key, toggling AI correction, and viewing recent dictation history with click-to-copy.
@@ -66,3 +67,5 @@ whisper-ctl open
 # Configure settings
 whisper-ctl config set correct_text false
 ```
+
+The built-in English spelling list handles clear product names even with AI correction off. To let AI decide whether a Thai phonetic spelling represents an English technical term, enable correction in the panel or run `whisper-ctl config set correct_text true`. The AI prompt asks it to leave ambiguous everyday words in Thai. Your `custom_dictionary` rules apply last and can override the built-in spelling.

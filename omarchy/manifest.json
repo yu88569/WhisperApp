@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "yux",
   "license": "MIT",
-  "description": "Fast voice-to-text dictation powered by Groq Whisper and Llama 3.3 AI text correction, dual-mode triggering, and bottom-center OSD overlay for Omarchy Linux.",
+  "description": "Fast Thai and English voice-to-text dictation powered by Groq Whisper and GPT-OSS text correction, dual-mode triggering, and bottom-center OSD overlay for Omarchy Linux.",
   "kinds": [
     "bar-widget"
   ],
@@ -20,15 +20,15 @@
     "defaultSection": "center",
     "defaults": {
       "showOsd": true,
-      "correctText": true,
-      "language": "auto"
+      "correctText": false,
+      "language": "th"
     },
     "schema": [
       {
         "key": "correctText",
         "type": "boolean",
-        "label": "AI Text Correction (Llama 3.3)",
-        "defaultValue": true
+        "label": "AI Text Correction (GPT-OSS)",
+        "defaultValue": false
       },
       {
         "key": "showOsd",

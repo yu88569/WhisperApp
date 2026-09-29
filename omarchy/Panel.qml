@@ -15,6 +15,7 @@ Panel {
   // Paths
   readonly property string scriptDir: Quickshell.env("HOME") + "/Projects/WhisperApp/omarchy"
   readonly property string statePath: Quickshell.env("HOME") + "/.local/state/omarchy/whisper.json"
+  readonly property string levelPath: Quickshell.env("HOME") + "/.local/state/omarchy/whisper-level.txt"
   readonly property string configPath: Quickshell.env("HOME") + "/.config/omarchy/whisper.json"
 
   // Dictation State
@@ -24,11 +25,12 @@ Panel {
   property real startedAt: 0.0
   property var historyList: []
   property int elapsedSeconds: 0
+  property real micLevel: 0
 
   // Config properties
   property string groqApiKey: ""
-  property bool correctText: true
-  property string language: "auto"
+  property bool correctText: false
+  property string language: "th"
   property bool showOsd: true
 
   // Feedback banner
@@ -98,6 +100,16 @@ Panel {
     onLoaded: root.parseConfig(text())
   }
 
+  FileView {
+    id: levelFileView
+    path: root.levelPath
+    watchChanges: true
+    atomicWrites: true
+    printErrors: false
+    onFileChanged: levelFileView.reload()
+    onLoaded: root.parseMicLevel(text())
+  }
+
   function reloadState() {
     stateFileView.reload()
   }
@@ -114,6 +126,7 @@ Panel {
       root.recognizedText = data.text || ""
       root.errorMessage = data.error || ""
       root.startedAt = data.started_at || 0.0
+      if (root.dictationState !== "recording") root.micLevel = 0
       if (Array.isArray(data.history)) {
         root.historyList = data.history
       }
@@ -127,13 +140,25 @@ Panel {
     }
   }
 
+  function parseMicLevel(raw) {
+    if (!raw) return
+    var level = Number(raw.trim())
+    if (root.dictationState === "recording" && isFinite(level)) {
+      root.micLevel = Math.max(0, Math.min(1, level))
+    }
+  }
+
   function parseConfig(raw) {
     if (!raw || raw.trim() === "") return
     try {
       var data = JSON.parse(raw)
       if (typeof data.groq_api_key === "string") root.groqApiKey = data.groq_api_key
       if (typeof data.correct_text === "boolean") root.correctText = data.correct_text
-      if (typeof data.language === "string") root.language = data.language
+      if (data.language === "th" || data.language === "en") {
+        root.language = data.language
+      } else {
+        root.language = "th"
+      }
     } catch (e) {
       console.warn("whisper: error parsing config JSON:", e)
     }
@@ -279,20 +304,32 @@ Panel {
             height: Style.space(24)
             Layout.alignment: Qt.AlignVCenter
 
-            Rectangle {
-              id: recDot
+            Row {
               visible: root.dictationState === "recording"
               anchors.centerIn: parent
-              width: Style.space(14)
-              height: Style.space(14)
-              radius: Style.space(7)
-              color: Color.urgent
+              width: Style.space(24)
+              height: Style.space(24)
+              spacing: Style.space(2)
 
-              SequentialAnimation on scale {
-                running: root.dictationState === "recording"
-                loops: Animation.Infinite
-                NumberAnimation { to: 1.3; duration: 500; easing.type: Easing.InOutQuad }
-                NumberAnimation { to: 0.9; duration: 500; easing.type: Easing.InOutQuad }
+              Repeater {
+                model: 5
+
+                Item {
+                  width: Style.space(3)
+                  height: Style.space(24)
+
+                  Rectangle {
+                    anchors.centerIn: parent
+                    width: parent.width
+                    height: Style.space(4 + root.micLevel * [6, 13, 18, 11, 7][index])
+                    radius: width / 2
+                    color: Color.urgent
+
+                    Behavior on height {
+                      NumberAnimation { duration: 85; easing.type: Easing.OutCubic }
+                    }
+                  }
+                }
               }
             }
 
@@ -438,7 +475,7 @@ Panel {
             }
 
             Text {
-              text: "Groq Whisper + Llama 3.3 AI"
+              text: "Groq Whisper + GPT-OSS AI"
               color: Qt.darker(root.contentForeground, 1.4)
               font.family: root.contentFontFamily
               font.pixelSize: Style.font.caption
@@ -545,10 +582,49 @@ Panel {
           }
         }
 
+        // Recognition language — deliberately limited to Thai and English.
+        Row {
+          width: parent.width
+          spacing: Style.space(8)
+
+          Text {
+            width: parent.width * 0.4
+            anchors.verticalCenter: parent.verticalCenter
+            text: "ภาษาที่พูด"
+            color: root.contentForeground
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.body
+          }
+
+          Button {
+            width: (parent.width * 0.6 - Style.space(16)) / 2
+            text: "ไทย + English"
+            active: root.language === "th"
+            onClicked: {
+              root.language = "th"
+              root.runCmd(["config", "set", "language", "th"])
+              root.feedbackMessage = "ตั้งภาษาหลักเป็นไทยแล้ว"
+              feedbackTimer.restart()
+            }
+          }
+
+          Button {
+            width: (parent.width * 0.6 - Style.space(16)) / 2
+            text: "English"
+            active: root.language === "en"
+            onClicked: {
+              root.language = "en"
+              root.runCmd(["config", "set", "language", "en"])
+              root.feedbackMessage = "Language set to English"
+              feedbackTimer.restart()
+            }
+          }
+        }
+
         // Toggle LLM Correction
         Toggle {
           width: parent.width
-          label: "เกลาภาษาด้วย AI (Llama 3.3)"
+          label: "เกลาภาษาด้วย AI (GPT-OSS)"
           description: "แก้คำสะกด วรรณยุกต์ และจัดวรรคตอนอัตโนมัติ"
           checked: root.correctText
           onClicked: {

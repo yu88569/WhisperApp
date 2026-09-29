@@ -9,6 +9,9 @@ import os
 import sys
 import time
 import json
+import re
+import math
+import array
 import uuid
 import signal
 import shutil
@@ -23,6 +26,7 @@ CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / 
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "omarchy"
 CONFIG_FILE = CONFIG_DIR / "whisper.json"
 STATE_FILE = STATE_DIR / "whisper.json"
+LEVEL_FILE = STATE_DIR / "whisper-level.txt"
 
 TEMP_WAV = Path("/tmp/whisper-active.wav")
 PID_FILE = Path("/tmp/whisper-record.pid")
@@ -33,9 +37,9 @@ GROQ_LLM_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 DEFAULT_CONFIG = {
     "groq_api_key": "",
-    "language": "auto",
-    "stt_model": "whisper-large-v3-turbo",
-    "correct_text": True,
+    "language": "th",
+    "stt_model": "whisper-large-v3",
+    "correct_text": False,
     "llm_model": "openai/gpt-oss-120b",
     "restore_clipboard": True,
     "paste_delay_ms": 350,
@@ -54,6 +58,34 @@ TERMINAL_CLASSES = {
     "foot", "alacritty", "kitty", "ghostty", "com.mitchellh.ghostty",
     "xterm", "wezterm", "gnome-terminal", "urxvt", "st", "terminator"
 }
+
+# High-confidence names only. Everyday loanwords such as "ไลน์" and "ซูม"
+# need context, so the optional AI correction handles those instead.
+COMMON_ENGLISH_TERMS = {
+    "กูเกิลโครม": "Google Chrome",
+    "กูเกิ้ลโครม": "Google Chrome",
+    "แชตจีพีที": "ChatGPT",
+    "แชทจีพีที": "ChatGPT",
+    "ดิสคอร์ด": "Discord",
+    "กิตฮับ": "GitHub",
+    "กิทฮับ": "GitHub",
+    "ยูทูบ": "YouTube",
+    "ยูทูป": "YouTube",
+    "กูเกิล": "Google",
+    "กูเกิ้ล": "Google",
+    "ด็อกเกอร์": "Docker",
+    "เฟซบุ๊ก": "Facebook",
+    "เฟสบุ๊ค": "Facebook",
+    "อินสตาแกรม": "Instagram",
+    "ติ๊กต็อก": "TikTok",
+    "เน็ตฟลิกซ์": "Netflix",
+    "โอเพนเอไอ": "OpenAI",
+    "ไมโครซอฟท์": "Microsoft",
+    "ไอโฟน": "iPhone",
+}
+ENGLISH_TERM_PATTERN = re.compile(
+    "|".join(re.escape(term) for term in sorted(COMMON_ENGLISH_TERMS, key=len, reverse=True))
+)
 
 
 # --- Configuration & State Helpers ---
@@ -74,6 +106,10 @@ def load_config() -> dict:
                     cfg.update(saved)
         except Exception as e:
             sys.stderr.write(f"whisper-core: warning reading config: {e}\n")
+    # Whisper auto-detection can mistake short Thai utterances for unrelated
+    # languages. This app deliberately supports only Thai and English.
+    if cfg.get("language") not in ("th", "en"):
+        cfg["language"] = DEFAULT_CONFIG["language"]
     return cfg
 
 
@@ -131,6 +167,77 @@ def is_recording_active() -> bool:
         return False
 
 
+def build_recording_command() -> list[str]:
+    """Capture the microphone at its native rate to avoid lossy local resampling."""
+    return [
+        "pw-record",
+        "--rate", "48000",
+        "--channels", "1",
+        "--format", "s16",
+        str(TEMP_WAV)
+    ]
+
+
+def read_recent_audio_level(path: Path, last_size: int) -> tuple[int, float]:
+    """Read only newly recorded 16-bit mono PCM and return a visible 0–1 level."""
+    try:
+        size = path.stat().st_size
+        if size <= max(last_size, 64):
+            return size, 0.0
+        with path.open("rb") as audio:
+            # pw-record writes a WAV header first; the final 100 ms is PCM data.
+            audio.seek(max(64, last_size, size - 9600))
+            data = audio.read()
+    except OSError:
+        return 0, 0.0
+
+    samples = array.array("h")
+    samples.frombytes(data[:len(data) & ~1])
+    if sys.byteorder != "little":
+        samples.byteswap()
+    if not samples:
+        return size, 0.0
+    rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples))
+    if rms == 0:
+        return size, 0.0
+    decibels = 20 * math.log10(rms / 32768)
+    return size, max(0.0, min(1.0, (decibels + 55) / 35))
+
+
+def write_audio_level(level: float) -> bool:
+    try:
+        ensure_dirs()
+        tmp = LEVEL_FILE.with_name(f"whisper-level.{os.getpid()}.tmp")
+        tmp.write_text(f"{level:.3f}")
+        tmp.replace(LEVEL_FILE)
+        return True
+    except OSError as e:
+        sys.stderr.write(f"whisper-core: could not update audio level: {e}\n")
+        return False
+
+
+def run_level_meter(recording_pid: int):
+    last_size = 0
+    last_level = 0.0
+    last_write = time.monotonic()
+    while True:
+        try:
+            if int(PID_FILE.read_text().strip()) != recording_pid:
+                break
+            os.kill(recording_pid, 0)
+        except (OSError, ValueError):
+            break
+
+        last_size, level = read_recent_audio_level(TEMP_WAV, last_size)
+        now = time.monotonic()
+        if abs(level - last_level) >= 0.02 or now - last_write >= 0.5:
+            if not write_audio_level(level):
+                break
+            last_level = level
+            last_write = now
+        time.sleep(0.08)
+
+
 def start_recording():
     if is_recording_active():
         sys.stderr.write("whisper-core: recording already in progress\n")
@@ -146,15 +253,10 @@ def start_recording():
         sys.stderr.write("whisper-core: pw-record not found\n")
         return
 
-    cmd = [
-        "pw-record",
-        "--rate", "16000",
-        "--channels", "1",
-        "--format", "s16",
-        str(TEMP_WAV)
-    ]
+    cmd = build_recording_command()
 
     try:
+        write_audio_level(0.0)
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
@@ -163,6 +265,15 @@ def start_recording():
         )
         PID_FILE.write_text(str(proc.pid))
         update_state(state="recording", text="", error="", started_at=time.time())
+        try:
+            subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "meter", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+        except OSError as e:
+            sys.stderr.write(f"whisper-core: audio level meter unavailable: {e}\n")
         print("RECORDING_STARTED")
     except Exception as e:
         update_state(state="error", error=f"Failed to start recording: {e}")
@@ -194,6 +305,7 @@ def stop_recording_and_process():
         sys.stderr.write(f"whisper-core: error stopping recording process: {e}\n")
     finally:
         PID_FILE.unlink(missing_ok=True)
+        write_audio_level(0.0)
 
     # Check audio file validity
     if not TEMP_WAV.exists() or TEMP_WAV.stat().st_size < 1000:
@@ -221,6 +333,7 @@ def cancel_recording():
     if KEYDOWN_FILE.exists():
         KEYDOWN_FILE.unlink(missing_ok=True)
 
+    write_audio_level(0.0)
     update_state(state="idle", text="", error="")
     print("CANCELLED")
 
@@ -297,17 +410,21 @@ def transcribe_audio(api_key: str, cfg: dict) -> str:
 
     boundary = f"----WebKitFormBoundary{uuid.uuid4().hex}"
     fields = {
-        "model": cfg.get("stt_model", "whisper-large-v3-turbo"),
-        "response_format": "json"
+        "model": cfg.get("stt_model", "whisper-large-v3"),
+        "response_format": "json",
+        "temperature": "0"
     }
 
-    lang = cfg.get("language", "auto")
-    if lang and lang != "auto":
-        fields["language"] = lang
+    lang = cfg.get("language", "th")
+    if lang not in ("th", "en"):
+        lang = "th"
+    fields["language"] = lang
 
     # Custom prompt / terminology hints
     dict_hints = [item.get("replace", "") for item in cfg.get("custom_dictionary", []) if isinstance(item, dict)]
     if dict_hints:
+        # Whisper treats prompt as preceding transcript, not as an instruction.
+        # Keep it to spelling hints so it cannot bias the recognized sentence.
         fields["prompt"] = ", ".join(dict_hints[:30])
 
     files = {
@@ -337,14 +454,20 @@ def correct_text_with_llm(raw_text: str, api_key: str, cfg: dict) -> str:
         return ""
 
     system_prompt = (
-        "You are a text correction assistant for speech-to-text output, which often contains "
-        "misheard words and missing punctuation.\n"
+        "You are a conservative formatter for speech-to-text output.\n"
         "Your tasks:\n"
-        "- Fix misheard/garbled words based on context\n"
-        "- Add punctuation and spacing to improve readability\n"
+        "- Add only punctuation, spacing, and unambiguous spelling marks\n"
+        "- Do not guess, infer, or paraphrase; preserve the spoken meaning\n"
+        "- Write clearly identifiable English names and technical terms in their usual English spelling, "
+        "even when the transcription uses Thai phonetic spelling. Examples when context fits: "
+        "ดิสคอร์ด -> Discord, โค้ด -> code, โปรเจกต์ -> project, "
+        "ฟีดแบ็ก -> feedback, คอนเทนต์ -> content, อีเมล -> email\n"
+        "- Leave ambiguous everyday Thai loanwords in Thai unless context clearly identifies an English term\n"
+        "- You must preserve every spoken word and its original order\n"
         "- Do NOT add new content, summarize, translate, or change word endings/speaker gender\n"
         "- Return ONLY the corrected text — no explanations, no quotation marks\n"
-        "The text may be in Thai, English, or mixed Thai/English."
+        "The text must contain only Thai, English, or mixed Thai/English. "
+        "Never translate it into another language."
     )
 
     custom_dict = cfg.get("custom_dictionary", [])
@@ -355,7 +478,7 @@ def correct_text_with_llm(raw_text: str, api_key: str, cfg: dict) -> str:
 
     payload = json.dumps({
         "model": cfg.get("llm_model", "openai/gpt-oss-120b"),
-        "temperature": 0.2,
+        "temperature": 0,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": raw_text}
@@ -381,6 +504,18 @@ def correct_text_with_llm(raw_text: str, api_key: str, cfg: dict) -> str:
     except Exception as e:
         sys.stderr.write(f"whisper-core: LLM correction failed, falling back to raw text: {e}\n")
         return raw_text
+
+
+def normalize_english_terms(text: str) -> str:
+    """Restore clear product names without guessing at ambiguous loanwords."""
+    def replace(match: re.Match) -> str:
+        before = text[match.start() - 1] if match.start() else ""
+        after = text[match.end()] if match.end() < len(text) else ""
+        left = " " if "\u0e00" <= before <= "\u0e7f" else ""
+        right = " " if "\u0e00" <= after <= "\u0e7f" else ""
+        return left + COMMON_ENGLISH_TERMS[match.group()] + right
+
+    return ENGLISH_TERM_PATTERN.sub(replace, text)
 
 
 def apply_custom_dictionary(text: str, custom_dict: list) -> str:
@@ -486,10 +621,13 @@ def process_audio_pipeline():
         update_state(state="correcting", text=raw_text)
         final_text = correct_text_with_llm(raw_text, api_key, cfg)
 
-    # 3. Deterministic dictionary replacement
+    # 3. Restore common English names; user dictionary has final say.
+    final_text = normalize_english_terms(final_text)
+
+    # 4. Deterministic dictionary replacement
     final_text = apply_custom_dictionary(final_text, cfg.get("custom_dictionary", []))
 
-    # 4. Smart Paste
+    # 5. Smart Paste
     update_state(state="pasting", text=final_text)
     smart_paste(
         final_text,
@@ -497,7 +635,7 @@ def process_audio_pipeline():
         delay_ms=cfg.get("paste_delay_ms", 350)
     )
 
-    # 5. Record History
+    # 6. Record History
     state = load_state()
     history = state.get("history", [])
     history.insert(0, {
@@ -564,6 +702,8 @@ def main():
                 cfg[key] = val
             save_config(cfg)
             print(f"Set {key} = {val}")
+    elif cmd == "meter" and len(sys.argv) == 3:
+        run_level_meter(int(sys.argv[2]))
     else:
         sys.stderr.write(f"Unknown command: {cmd}\n")
         sys.exit(1)
